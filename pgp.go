@@ -416,3 +416,277 @@ func CertifyOnlineWithOffline(offlineKey, onlineKey *Keys, passphrase string) (*
 		PrivateKey: onlineKey.PrivateKey,
 	}, nil
 }
+
+// NewKeyRingFromKeys constructs a KeyRing from one or more keys.
+// All keys must be non-nil. At least one key is required.
+func NewKeyRingFromKeys(keys ...*gopgp.Key) (*gopgp.KeyRing, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("at least one key is required")
+	}
+
+	if keys[0] == nil {
+		return nil, errors.New("keys[0] is nil")
+	}
+
+	keyRing, err := gopgp.NewKeyRing(keys[0])
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 1; i < len(keys); i++ {
+		if keys[i] == nil {
+			return nil, fmt.Errorf("key at index %d is nil", i)
+		}
+		if err := keyRing.AddKey(keys[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	return keyRing, nil
+}
+
+// EncryptMessageForRecipients encrypts a plaintext string to multiple
+// recipient public keys. Any corresponding private key can decrypt it.
+//
+// All keys must be encryption-capable public keys (or mixed pub/priv
+// where priv is treated as pub).
+func EncryptMessageForRecipients(publicKeys []*gopgp.Key, message string) (string, error) {
+	if len(publicKeys) == 0 {
+		return "", errors.New("at least one recipient key is required")
+	}
+	if message == "" {
+		return "", errors.New("message must not be empty")
+	}
+
+	recipientRing, err := NewKeyRingFromKeys(publicKeys...)
+	if err != nil {
+		return "", err
+	}
+
+	if recipientRing.CountEntities() == 0 {
+		return "", errors.New("recipient keyring is empty")
+	}
+
+	pgpHandle := gopgp.PGP()
+	encHandle, err := pgpHandle.
+		Encryption().
+		Recipients(recipientRing).
+		New()
+	if err != nil {
+		return "", err
+	}
+
+	pgpMessage, err := encHandle.Encrypt([]byte(message))
+	if err != nil {
+		return "", err
+	}
+
+	armored, err := pgpMessage.Armor()
+	if err != nil {
+		return "", err
+	}
+
+	return armored, nil
+}
+
+// DecryptMessageWithMultipleKeys decrypts an armored PGP message using
+// any of the (unlocked) private keys in the slice. The first key that
+// matches one of the encrypted session key packets is used.
+//
+// All private keys must be unlocked (use DecryptKey first if needed).
+func DecryptMessageWithMultipleKeys(privateKeys []*gopgp.Key, encryptedMessage string) (string, error) {
+	if len(privateKeys) == 0 {
+		return "", errors.New("at least one private key is required")
+	}
+	if encryptedMessage == "" {
+		return "", errors.New("encrypted message must not be empty")
+	}
+
+	decryptionRing, err := NewKeyRingFromKeys(privateKeys...)
+	if err != nil {
+		return "", err
+	}
+
+	if decryptionRing.CountDecryptionEntities(0) == 0 {
+		return "", errors.New("no decryption-capable keys in keyring")
+	}
+
+	pgpHandle := gopgp.PGP()
+	decHandle, err := pgpHandle.
+		Decryption().
+		DecryptionKeys(decryptionRing).
+		New()
+	if err != nil {
+		return "", err
+	}
+
+	decrypted, err := decHandle.Decrypt([]byte(encryptedMessage), gopgp.Armor)
+	if err != nil {
+		return "", err
+	}
+
+	return decrypted.String(), nil
+}
+
+// SignMessageWithMultipleKeys creates a detached armored signature
+// over the message using all provided (unlocked) signing keys.
+// The result is a single OpenPGP signature blob that may contain
+// multiple signatures.
+// SignMessageWithMultipleKeys creates a detached armored signature for the
+// given message using all provided unlocked private keys.
+//
+// The returned string is a single detached signature that may contain
+// multiple OpenPGP signature packets (one per key).
+func SignMessageWithMultipleKeys(privateKeys []*gopgp.Key, message string) (string, error) {
+	if len(privateKeys) == 0 {
+		return "", errors.New("no private keys provided")
+	}
+
+	signingRing, err := buildKeyRingFromKeys(privateKeys)
+	if err != nil {
+		return "", err
+	}
+
+	pgpHandle := gopgp.PGP()
+	signer, err := pgpHandle.
+		Sign().
+		SigningKeys(signingRing).
+		Detached().
+		New()
+	if err != nil {
+		return "", err
+	}
+	defer signer.ClearPrivateParams()
+
+	sigBytes, err := signer.Sign([]byte(message), gopgp.Armor)
+	if err != nil {
+		return "", err
+	}
+
+	return string(sigBytes), nil
+}
+
+// VerifyMessageWithMultipleKeys verifies a detached armored signature
+// over message using a set of public keys. It returns true if at least
+// one valid signature is found that matches one of the keys.
+// VerifyMessageWithMultipleKeys verifies a detached armored signature over
+// the given message using any of the supplied public keys.
+//
+// It returns true if the signature verifies with at least one key in the
+// set, false if verification fails, and an error only for non-signature
+// problems (parsing, bad armor, etc.).
+func VerifyMessageWithMultipleKeys(publicKeys []*gopgp.Key, message, signature string) (bool, error) {
+	if len(publicKeys) == 0 {
+		return false, errors.New("no public keys provided")
+	}
+	if signature == "" {
+		return false, errors.New("signature must not be empty")
+	}
+
+	verifyRing, err := buildKeyRingFromKeys(publicKeys)
+	if err != nil {
+		return false, err
+	}
+
+	pgpHandle := gopgp.PGP()
+	verifier, err := pgpHandle.
+		Verify().
+		VerificationKeys(verifyRing).
+		New()
+	if err != nil {
+		return false, err
+	}
+
+	verifyResult, err := verifier.VerifyDetached(
+		[]byte(message),
+		[]byte(signature),
+		gopgp.Armor,
+	)
+	if err != nil {
+		// Parsing/format/other non-signature error.
+		return false, err
+	}
+
+	if sigErr := verifyResult.SignatureError(); sigErr != nil {
+		// Signature didn't verify with any key in the keyring.
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// EncryptAndSignMessageForMultiple encrypts message to multiple recipients
+// and signs it with multiple signing keys in one operation.
+//
+// All signing keys must be unlocked private keys.
+func EncryptAndSignMessageForMultiple(
+	publicKeys []*gopgp.Key,
+	signingPrivateKeys []*gopgp.Key,
+	message string,
+) (string, error) {
+	if len(publicKeys) == 0 {
+		return "", errors.New("at least one recipient key is required")
+	}
+	if len(signingPrivateKeys) == 0 {
+		return "", errors.New("at least one signing key is required")
+	}
+	if message == "" {
+		return "", errors.New("message must not be empty")
+	}
+
+	recipientRing, err := NewKeyRingFromKeys(publicKeys...)
+	if err != nil {
+		return "", err
+	}
+	signingRing, err := NewKeyRingFromKeys(signingPrivateKeys...)
+	if err != nil {
+		return "", err
+	}
+
+	pgpHandle := gopgp.PGP()
+	encHandle, err := pgpHandle.
+		Encryption().
+		Recipients(recipientRing).
+		SigningKeys(signingRing).
+		New()
+	if err != nil {
+		return "", err
+	}
+	defer encHandle.ClearPrivateParams()
+
+	pgpMessage, err := encHandle.Encrypt([]byte(message))
+	if err != nil {
+		return "", err
+	}
+
+	armored, err := pgpMessage.Armor()
+	if err != nil {
+		return "", err
+	}
+
+	return armored, nil
+}
+
+// buildKeyRingFromKeys creates a KeyRing from a slice of keys.
+// It requires at least one key.
+func buildKeyRingFromKeys(keys []*gopgp.Key) (*gopgp.KeyRing, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("no keys provided")
+	}
+
+	ring, err := gopgp.NewKeyRing(keys[0])
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 1; i < len(keys); i++ {
+		if keys[i] == nil {
+			return nil, errors.New("nil key in keys slice")
+		}
+		if err := ring.AddKey(keys[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	return ring, nil
+}
