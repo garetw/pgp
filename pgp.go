@@ -1,13 +1,9 @@
 package pgp
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"strings"
 
-	pmopenpgp "github.com/ProtonMail/go-crypto/openpgp"
-	pmarmor "github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/gopenpgp/v3/constants"
 	gopgp "github.com/ProtonMail/gopenpgp/v3/crypto"
 	"github.com/ProtonMail/gopenpgp/v3/profile"
@@ -69,8 +65,7 @@ func GenerateKey(kp KeyProps) (*Keys, error) {
 		// Default profile → Curve25519 EC key.
 		pgpHandle = gopgp.PGPWithProfile(profile.Default())
 	default:
-		// Default to modern EC keys.
-		pgpHandle = gopgp.PGPWithProfile(profile.Default())
+		return nil, fmt.Errorf("unsupported key type %q (use %q or %q)", kp.KeyType, RSA, X25519)
 	}
 
 	keyGenHandle := pgpHandle.
@@ -346,75 +341,6 @@ func DecryptMessage(privateKey *gopgp.Key, encryptedMessage string) (string, err
 	}
 
 	return decrypted.String(), nil
-}
-
-// CertifyOnlineWithOffline uses the offline key to add OpenPGP
-// certification signatures over all identities on onlineKey.PublicKey.
-// The returned Keys value has the same private key as onlineKey, but its
-// public key includes the new third-party certifications from the offline key.
-//
-// offlineKey.PrivateKey is the offline private key (armored).
-// onlineKey.PublicKey is the online public key to be certified.
-// passphrase decrypts the offline private key.
-func CertifyOnlineWithOffline(offlineKey, onlineKey *Keys, passphrase string) (*Keys, error) {
-	if offlineKey == nil || onlineKey == nil {
-		return nil, fmt.Errorf("offlineKey and onlineKey must not be nil")
-	}
-	if passphrase == "" {
-		return nil, fmt.Errorf("passphrase must not be empty")
-	}
-
-	// 1. Read the offline private key (signer) into an EntityList.
-	offlineEntityList, err := pmopenpgp.ReadArmoredKeyRing(strings.NewReader(offlineKey.PrivateKey))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read offline key ring: %w", err)
-	}
-	if len(offlineEntityList) != 1 {
-		return nil, fmt.Errorf("expected 1 entity in offline key ring, got %d", len(offlineEntityList))
-	}
-	signer := offlineEntityList[0]
-
-	// 2. Decrypt all private keys in the signer entity.
-	if err := signer.DecryptPrivateKeys([]byte(passphrase)); err != nil {
-		return nil, fmt.Errorf("failed to decrypt offline private key(s): %w", err)
-	}
-
-	// 3. Read the online public key into an EntityList.
-	onlineEntityList, err := pmopenpgp.ReadArmoredKeyRing(strings.NewReader(onlineKey.PublicKey))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read online key ring: %w", err)
-	}
-	if len(onlineEntityList) != 1 {
-		return nil, fmt.Errorf("expected 1 entity in online key ring, got %d", len(onlineEntityList))
-	}
-	target := onlineEntityList[0]
-
-	// 4. Have the offline entity certify every identity on the online key.
-	for identityName := range target.Identities {
-		if err := target.SignIdentity(identityName, signer, nil); err != nil {
-			return nil, fmt.Errorf("error signing identity %q: %w", identityName, err)
-		}
-	}
-
-	// 5. Serialize the newly certified online public key back to armor.
-	var buf bytes.Buffer
-	w, err := pmarmor.Encode(&buf, pmopenpgp.PublicKeyType, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create armor encoder: %w", err)
-	}
-	if err := target.Serialize(w); err != nil {
-		_ = w.Close()
-		return nil, fmt.Errorf("failed to serialize certified key: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close armor encoder: %w", err)
-	}
-
-	// 6. Return the new key object: same private key, updated public key.
-	return &Keys{
-		PublicKey:  buf.String(),
-		PrivateKey: onlineKey.PrivateKey,
-	}, nil
 }
 
 // NewKeyRingFromKeys constructs a KeyRing from one or more keys.
